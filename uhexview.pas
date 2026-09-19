@@ -35,6 +35,38 @@ type
     // read up to ALen bytes at APos into ABuf; returns bytes actually read
     function ReadAt(APos: TFileOfs; var ABuf; ALen: Integer): Integer;
       virtual; abstract;
+    // sources that can be written back to override these; the default source
+    // is read-only, so nothing writes anywhere unless it opted in
+    function CanWrite: Boolean; virtual;
+    // write ALen bytes at APos; returns bytes written, raises on device error
+    function WriteAt(APos: TFileOfs; const ABuf; ALen: Integer): Integer; virtual;
+    procedure Flush; virtual;
+    // read for verification purposes: must defeat every cache between us and
+    // the platter. The default is a plain read; sources that can do better
+    // (a raw device: a brand-new handle) override it.
+    function VerifyReadAt(APos: TFileOfs; var ABuf; ALen: Integer): Integer; virtual;
+  end;
+
+  // a contiguous run of edited bytes, in final-image coordinates
+  TModRange = record
+    Start, Len: TFileOfs;
+  end;
+  TModRanges = array of TModRange;
+
+  { raised when the device itself could not be opened; Code is the OS error,
+    5 (access denied) meaning "not running as administrator" }
+  EHexOpen = class(Exception)
+  public
+    Code: LongWord;
+    constructor CreateFor(const ADevice: string; ACode: LongWord);
+  end;
+
+  { raised when a write reported success but reading the bytes back gives
+    something else - the case where Windows quietly drops a raw-device write }
+  EHexVerify = class(Exception)
+  public
+    Offset: TFileOfs;
+    constructor CreateAt(AOffset: TFileOfs);
   end;
 
   { whole buffer held in memory (small files / clipboard data) }
@@ -73,14 +105,64 @@ type
     {$ELSE}
     FStream: TFileStream;
     {$ENDIF}
+    {$IFDEF WINDOWS}
+    FVolLocks: array of THandle;   // volumes held open+locked while writing
+    FMem: Pointer;                 // sector-aligned buffer (FILE_FLAG_NO_BUFFERING)
+    FMemLen: Integer;
+    {$ENDIF}
     FSize: TFileOfs;
     FSector: Integer;
+    FWritable: Boolean;
+    FLockVols: Boolean;          // may we lock/dismount the volumes?
+    FExclusive: Boolean;
+    FDevice: string;
+    FLockLog: string;            // what happened to each volume at open time
+    FVolAreas: array of TModRange;   // disk areas occupied by mounted volumes
+    FAllDismounted: Boolean;         // every volume of this device let go
     FBuf: array of Byte;
+    {$IFDEF WINDOWS}
+    procedure QuerySectorSize;
+    procedure LockVolumes;
+    procedure UnlockVolumes;
+    {$ENDIF}
+    function WorkBuf(ALen: Integer): PByte;
   public
-    constructor Create(const ADevice: string);
+    // AWritable opens the device for writing too; it fails loudly (raises) when
+    // the caller lacks the rights, rather than silently degrading to read-only
+    // ALockVolumes = False opens the device without locking or dismounting the
+    // volumes on it - useful when that very cycle is what corrupts the result
+    constructor Create(const ADevice: string; AWritable: Boolean = False;
+      ALockVolumes: Boolean = True);
     destructor Destroy; override;
     function Size: TFileOfs; override;
     function ReadAt(APos: TFileOfs; var ABuf; ALen: Integer): Integer; override;
+    function CanWrite: Boolean; override;
+    // sector-aligned read-modify-write; never changes the device length
+    function WriteAt(APos: TFileOfs; const ABuf; ALen: Integer): Integer; override;
+    procedure Flush; override;
+    // reads through a handle opened just for this read, so neither Windows nor
+    // the storage stack can answer from something it cached a moment ago
+    function VerifyReadAt(APos: TFileOfs; var ABuf; ALen: Integer): Integer; override;
+    property Device: string read FDevice;
+    property SectorSize: Integer read FSector;
+    // True when the volumes living on this device were locked for us
+    property Exclusive: Boolean read FExclusive;
+    // per-volume outcome of the locking attempt, one line each
+    property LockLog: string read FLockLog;
+    // Ask Windows to stop the device, exactly like "Safely remove hardware".
+    // On a USB stick this is what makes the controller flush its cache for
+    // good. Returns a human-readable outcome.
+    function EjectDevice: string;
+    // True when AOfs falls inside a volume that Windows has mounted on this
+    // device - the sectors a file-system driver believes it owns
+    function InMountedVolume(AOfs: TFileOfs): Boolean;
+    // False when a volume of this device stayed mounted: writes inside it can
+    // be undone by its file-system driver
+    property VolumesDismounted: Boolean read FAllDismounted;
+    // Step-by-step probe of the write path at ATestOffset. It flips one byte
+    // and puts it straight back, reporting every call and error code, so a
+    // silent failure can be pinned on a specific step.
+    function Diagnose(ATestOffset: TFileOfs): string;
   end;
 
   { non-destructive piece-table editing layer over any backing source --------- }
@@ -107,6 +189,7 @@ type
     FPieces: TPieceArray;
     FSize: TFileOfs;
     FModified: Boolean;
+    FFixedLength: Boolean;
     FUndo: array of TUndoState;
     FRedo: array of TUndoState;
     procedure RecomputeSize;
@@ -136,6 +219,17 @@ type
     procedure Rebase(ANewBack: TByteSource; AOwnsBack: Boolean);
     procedure CloseBacking;
     function BackingFileName: string;
+    // the edited runs, in final-image coordinates (adjacent ones merged)
+    function ModifiedRanges: TModRanges;
+    function ModifiedByteCount: TFileOfs;
+    function CanCommit: Boolean;
+    // write the edited runs back into the backing source in place, then start
+    // over from a clean slate (undo history is dropped - it is on the disk now)
+    procedure CommitToBacking;
+    // when set, the image can never change length: insert and delete are
+    // refused and overwrites are clipped to the existing end. Set it for any
+    // backing that cannot grow - a raw device, most of all.
+    property FixedLength: Boolean read FFixedLength write FFixedLength;
     property Modified: Boolean read FModified write FModified;
     property Backing: TByteSource read FBack;
   end;
@@ -243,6 +337,16 @@ type
     procedure OverwriteSelection(const AData: TBytes);
     procedure ApplySelectionOp(AOp: THexOp; AOperand: Byte);
     procedure SaveToFile(const AFileName: string);
+
+    // in-place write-back into the backing source (raw device editing)
+    procedure OpenDevice(const ADevice: string; AWritable: Boolean;
+      ALockVolumes: Boolean = True);
+    function IsFixedLength: Boolean;
+    function CanCommit: Boolean;          // editable AND backing accepts writes
+    function ModifiedRanges: TModRanges;
+    function ModifiedByteCount: TFileOfs;
+    procedure CommitToBacking;
+
     property EditSource: TEditByteSource read FEdit;
     property Source: TByteSource read FSource;
 
@@ -316,6 +420,40 @@ begin
     HexPair[b][0] := HEXDIG[b shr 4];
     HexPair[b][1] := HEXDIG[b and 15];
   end;
+end;
+
+constructor EHexOpen.CreateFor(const ADevice: string; ACode: LongWord);
+begin
+  inherited CreateFmt('Cannot open %s (error %d)', [ADevice, ACode]);
+  Code := ACode;
+end;
+
+constructor EHexVerify.CreateAt(AOffset: TFileOfs);
+begin
+  inherited CreateFmt('Write not confirmed at offset 0x%s - the device read ' +
+    'back the old bytes.', [IntToHex(AOffset, 8)]);
+  Offset := AOffset;
+end;
+
+{ TByteSource - read-only by default ----------------------------------------- }
+
+function TByteSource.CanWrite: Boolean;
+begin
+  Result := False;
+end;
+
+function TByteSource.WriteAt(APos: TFileOfs; const ABuf; ALen: Integer): Integer;
+begin
+  Result := 0;   // a source that cannot write simply writes nothing
+end;
+
+procedure TByteSource.Flush;
+begin
+end;
+
+function TByteSource.VerifyReadAt(APos: TFileOfs; var ABuf; ALen: Integer): Integer;
+begin
+  Result := ReadAt(APos, ABuf, ALen);
 end;
 
 { TMemByteSource ------------------------------------------------------------- }
@@ -392,7 +530,43 @@ end;
 
 {$IFDEF WINDOWS}
 const
-  IOCTL_DISK_GET_LENGTH_INFO = $0007405C;
+  IOCTL_DISK_GET_LENGTH_INFO       = $0007405C;
+  IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = $000700A0;
+  IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = $00560000;
+  // exclusive access to a volume, and permission to touch every sector of it
+  FSCTL_LOCK_VOLUME             = $00090018;
+  FSCTL_UNLOCK_VOLUME           = $0009001C;
+  FSCTL_DISMOUNT_VOLUME         = $00090020;
+  FSCTL_ALLOW_EXTENDED_DASD_IO  = $000900CC;
+  // what "Safely remove hardware" does: stop the unit so the drive's own
+  // controller is forced to commit everything it is still holding in RAM
+  IOCTL_STORAGE_MEDIA_REMOVAL   = $002D4804;
+  IOCTL_STORAGE_EJECT_MEDIA     = $002D4808;
+
+{$PACKRECORDS C}
+type
+  TDiskGeometryRec = record
+    Cylinders: Int64;
+    MediaType: DWORD;
+    TracksPerCylinder: DWORD;
+    SectorsPerTrack: DWORD;
+    BytesPerSector: DWORD;
+  end;
+  TDiskGeometryExRec = record
+    Geometry: TDiskGeometryRec;
+    DiskSize: Int64;
+    Data: array[0..0] of Byte;
+  end;
+  TDiskExtentRec = record
+    DiskNumber: DWORD;
+    StartingOffset: Int64;
+    ExtentLength: Int64;
+  end;
+  TVolumeDiskExtentsRec = record
+    NumberOfDiskExtents: DWORD;
+    Extents: array[0..7] of TDiskExtentRec;
+  end;
+{$PACKRECORDS DEFAULT}
 
 // FPC's Windows unit exposes SetFilePointer (32-bit) but not the Ex variant;
 // declare it ourselves (available on every Windows since XP)
@@ -401,41 +575,786 @@ function SetFilePointerEx(hFile: THandle; liDistanceToMove: Int64;
   external 'kernel32' name 'SetFilePointerEx';
 {$ENDIF}
 
-constructor TRawDeviceByteSource.Create(const ADevice: string);
+{$IFDEF WINDOWS}
+// The real sector size. Hard-coding 512 breaks 4Kn drives and many USB sticks:
+// with FILE_FLAG_NO_BUFFERING every offset and length must be a multiple of it.
+procedure TRawDeviceByteSource.QuerySectorSize;
+var gx: TDiskGeometryExRec; br: DWORD;
+begin
+  FillChar(gx, SizeOf(gx), 0); br := 0;
+  if DeviceIoControl(FHandle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, nil, 0,
+       @gx, SizeOf(gx), br, nil) then
+    if (gx.Geometry.BytesPerSector >= 512) and
+       (gx.Geometry.BytesPerSector <= 65536) then
+      FSector := gx.Geometry.BytesPerSector;
+end;
+
+// Windows refuses (or silently drops) writes to sectors owned by a mounted
+// volume. Take every volume that lives on this device, lock it, and ask for
+// extended DASD I/O so the whole volume - not just its free space - is ours.
+// Best effort: a volume in use stays unlocked and only that area may fail.
+procedure TRawDeviceByteSource.LockVolumes;
+var
+  drives: array[0..255] of Char;
+  p: PChar;
+  letter, vol: string;
+  h: THandle;
+  ext: TVolumeDiskExtentsRec;
+  br: DWORD;
+  i, n: Integer;
+  wantDisk: Integer;
+  mine, locked: Boolean;
+  err: DWORD;
+begin
+  FExclusive := False;
+  FLockLog := '';
+  FAllDismounted := True;
+  // \\.\X: - lock that one volume;  \\.\PhysicalDriveN - lock all of its volumes
+  wantDisk := -1;
+  if Pos('PHYSICALDRIVE', UpperCase(FDevice)) > 0 then
+    wantDisk := StrToIntDef(Copy(UpperCase(FDevice),
+      Pos('PHYSICALDRIVE', UpperCase(FDevice)) + 13, 8), -1);
+
+  FillChar(drives, SizeOf(drives), 0);
+  if GetLogicalDriveStrings(SizeOf(drives) - 1, drives) = 0 then
+  begin
+    FLockLog := '  (no logical drives enumerated)' + LineEnding;
+    Exit;
+  end;
+  p := @drives[0];
+  while p^ <> #0 do
+  begin
+    letter := Copy(string(p), 1, 2);
+    vol := '\\.\' + letter;
+    mine := False;
+    if wantDisk < 0 then
+      mine := SameText(vol, FDevice)
+    else
+    begin
+      h := CreateFile(PChar(vol), 0, FILE_SHARE_READ or FILE_SHARE_WRITE, nil,
+             OPEN_EXISTING, 0, 0);
+      if h <> INVALID_HANDLE_VALUE then
+      try
+        FillChar(ext, SizeOf(ext), 0); br := 0;
+        if DeviceIoControl(h, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, nil, 0,
+             @ext, SizeOf(ext), br, nil) then
+          for i := 0 to Integer(ext.NumberOfDiskExtents) - 1 do
+            if (i <= High(ext.Extents)) and
+               (Integer(ext.Extents[i].DiskNumber) = wantDisk) then
+            begin
+              mine := True;
+              // remember which part of the disk this volume owns
+              n := Length(FVolAreas); SetLength(FVolAreas, n + 1);
+              FVolAreas[n].Start := ext.Extents[i].StartingOffset;
+              FVolAreas[n].Len := ext.Extents[i].ExtentLength;
+              FLockLog := FLockLog + Format(
+                '  %s: occupies 0x%s .. 0x%s of this disk',
+                [letter, IntToHex(ext.Extents[i].StartingOffset, 8),
+                 IntToHex(ext.Extents[i].StartingOffset +
+                          ext.Extents[i].ExtentLength - 1, 8)]) + LineEnding;
+            end;
+      finally
+        CloseHandle(h);
+      end;
+    end;
+
+    if mine and not FLockVols then
+      FLockLog := FLockLog + Format(
+        '  %s: left mounted (locking not requested)', [letter]) + LineEnding;
+
+    if mine and FLockVols then
+    begin
+      h := CreateFile(PChar(vol), GENERIC_READ or GENERIC_WRITE,
+             FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING, 0, 0);
+      if h = INVALID_HANDLE_VALUE then
+        FLockLog := FLockLog + Format('  %s: cannot open (error %d)',
+          [letter, GetLastError]) + LineEnding
+      else
+      begin
+        // ask for whole-volume access BEFORE locking (afterwards it is refused)
+        br := 0;
+        if DeviceIoControl(h, FSCTL_ALLOW_EXTENDED_DASD_IO, nil, 0, nil, 0, br, nil) then
+          FLockLog := FLockLog + Format('  %s: extended DASD I/O allowed',
+            [letter]) + LineEnding
+        else
+          FLockLog := FLockLog + Format(
+            '  %s: extended DASD I/O refused (error %d)',
+            [letter, GetLastError]) + LineEnding;
+
+        br := 0;
+        locked := DeviceIoControl(h, FSCTL_LOCK_VOLUME, nil, 0, nil, 0, br, nil);
+        if not locked then
+        begin
+          err := GetLastError;
+          FLockLog := FLockLog + Format('  %s: NOT locked (error %d)',
+            [letter, err]) + LineEnding;
+        end
+        else
+          FLockLog := FLockLog + Format('  %s: locked', [letter]) + LineEnding;
+
+        // Locking alone is NOT enough. The file-system driver keeps its own
+        // cached metadata and flushes it back over our sectors the moment the
+        // volume is released - which is exactly how an edit at sector 8 comes
+        // back as it was. Dismounting makes the driver drop that cache and
+        // re-read from the media when Windows mounts the volume again.
+        br := 0;
+        if DeviceIoControl(h, FSCTL_DISMOUNT_VOLUME, nil, 0, nil, 0, br, nil) then
+          FLockLog := FLockLog + Format('  %s: dismounted (cache dropped)',
+            [letter]) + LineEnding
+        else
+        begin
+          FAllDismounted := False;
+          FLockLog := FLockLog + Format('  %s: NOT dismounted (error %d)' +
+            ' - edits inside this volume may be undone by Windows',
+            [letter, GetLastError]) + LineEnding;
+        end;
+
+        // keep the handle open either way: a dismounted volume must not be
+        // remounted under us while we write
+        n := Length(FVolLocks); SetLength(FVolLocks, n + 1);
+        FVolLocks[n] := h;
+        if locked then FExclusive := True;
+      end;
+    end;
+    p := p + Length(string(p)) + 1;
+  end;
+end;
+
+procedure TRawDeviceByteSource.UnlockVolumes;
+var i: Integer; br: DWORD;
+begin
+  for i := 0 to High(FVolLocks) do
+    if FVolLocks[i] <> INVALID_HANDLE_VALUE then
+    begin
+      br := 0;
+      DeviceIoControl(FVolLocks[i], FSCTL_UNLOCK_VOLUME, nil, 0, nil, 0, br, nil);
+      CloseHandle(FVolLocks[i]);
+    end;
+  SetLength(FVolLocks, 0);
+  FExclusive := False;
+end;
+{$ENDIF}
+
+// Working buffer for the sector-aligned window. In writable mode the buffer
+// itself must be sector-aligned as well (FILE_FLAG_NO_BUFFERING), which a
+// plain dynamic array does not guarantee - VirtualAlloc does.
+function TRawDeviceByteSource.WorkBuf(ALen: Integer): PByte;
+begin
+  {$IFDEF WINDOWS}
+  if FWritable then
+  begin
+    if ALen > FMemLen then
+    begin
+      if FMem <> nil then VirtualFree(FMem, 0, MEM_RELEASE);
+      FMemLen := ((ALen + $FFFF) div $10000) * $10000;    // round to 64 KB
+      FMem := VirtualAlloc(nil, FMemLen, MEM_COMMIT or MEM_RESERVE,
+                PAGE_READWRITE);
+      if FMem = nil then
+      begin
+        FMemLen := 0;
+        raise Exception.Create('Out of memory for the device buffer.');
+      end;
+    end;
+    Exit(PByte(FMem));
+  end;
+  {$ENDIF}
+  if Length(FBuf) < ALen then SetLength(FBuf, ALen);
+  Result := PByte(@FBuf[0]);
+end;
+
+function TRawDeviceByteSource.InMountedVolume(AOfs: TFileOfs): Boolean;
+{$IFDEF WINDOWS}
+var i: Integer;
+begin
+  Result := False;
+  for i := 0 to High(FVolAreas) do
+    if (AOfs >= FVolAreas[i].Start) and
+       (AOfs < FVolAreas[i].Start + FVolAreas[i].Len) then Exit(True);
+end;
+{$ELSE}
+begin
+  Result := False;
+end;
+{$ENDIF}
+
+function TRawDeviceByteSource.VerifyReadAt(APos: TFileOfs; var ABuf;
+  ALen: Integer): Integer;
+var
+  alignStart, alignEnd: TFileOfs;
+  alignLen, ofs: Integer;
+  {$IFDEF WINDOWS}
+  h: THandle;
+  mem: Pointer;
+  got: Int64;
+  nread: DWORD;
+  {$ELSE}
+  fs: TFileStream;
+  mem: PByte;
+  nread: Integer;
+  {$ENDIF}
+begin
+  Result := 0;
+  if (APos < 0) or (ALen <= 0) then Exit;
+  if (FSize > 0) and (APos >= FSize) then Exit;
+  if (FSize > 0) and (APos + ALen > FSize) then ALen := FSize - APos;
+  alignStart := (APos div FSector) * FSector;
+  alignEnd := ((APos + ALen + FSector - 1) div FSector) * FSector;
+  alignLen := Integer(alignEnd - alignStart);
+  ofs := Integer(APos - alignStart);
+
+  {$IFDEF WINDOWS}
+  h := CreateFile(PChar(FDevice), GENERIC_READ,
+         FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING,
+         FILE_ATTRIBUTE_NORMAL or FILE_FLAG_NO_BUFFERING, 0);
+  if h = INVALID_HANDLE_VALUE then
+    Exit(ReadAt(APos, ABuf, ALen));            // no second handle - do our best
+  try
+    mem := VirtualAlloc(nil, alignLen, MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE);
+    if mem = nil then Exit(ReadAt(APos, ABuf, ALen));
+    try
+      if not SetFilePointerEx(h, alignStart, @got, FILE_BEGIN) then Exit;
+      nread := 0;
+      if not ReadFile(h, mem^, alignLen, nread, nil) then Exit;
+      if Integer(nread) < ofs then Exit;
+      Result := Integer(nread) - ofs;
+      if Result > ALen then Result := ALen;
+      if Result > 0 then System.Move((PByte(mem) + ofs)^, ABuf, Result);
+    finally
+      VirtualFree(mem, 0, MEM_RELEASE);
+    end;
+  finally
+    CloseHandle(h);
+  end;
+  {$ELSE}
+  try
+    fs := TFileStream.Create(FDevice, fmOpenRead or fmShareDenyNone);
+  except
+    Exit(ReadAt(APos, ABuf, ALen));
+  end;
+  try
+    GetMem(mem, alignLen);
+    try
+      fs.Position := alignStart;
+      nread := fs.Read(mem^, alignLen);
+      if nread < ofs then Exit;
+      Result := nread - ofs;
+      if Result > ALen then Result := ALen;
+      if Result > 0 then System.Move((mem + ofs)^, ABuf, Result);
+    finally
+      FreeMem(mem);
+    end;
+  finally
+    fs.Free;
+  end;
+  {$ENDIF}
+end;
+
+function TRawDeviceByteSource.EjectDevice: string;
+{$IFDEF WINDOWS}
+type
+  TPreventMediaRemoval = record PreventMediaRemoval: ByteBool; end;
+var
+  br: DWORD;
+  pmr: TPreventMediaRemoval;
+begin
+  Result := '';
+  if FHandle = INVALID_HANDLE_VALUE then
+    Exit('The device is not open.');
+  Flush;
+  pmr.PreventMediaRemoval := False;
+  br := 0;
+  if not DeviceIoControl(FHandle, IOCTL_STORAGE_MEDIA_REMOVAL, @pmr, SizeOf(pmr),
+       nil, 0, br, nil) then
+    Result := Format('MEDIA_REMOVAL refused (error %d). ', [GetLastError]);
+  br := 0;
+  if DeviceIoControl(FHandle, IOCTL_STORAGE_EJECT_MEDIA, nil, 0, nil, 0, br, nil) then
+    Result := Result + 'Device stopped - it is safe to unplug it now.'
+  else
+    Result := Result + Format('EJECT_MEDIA failed (error %d).', [GetLastError]);
+end;
+{$ELSE}
+begin
+  Result := 'Not available on this platform.';
+end;
+{$ENDIF}
+
+function TRawDeviceByteSource.Diagnose(ATestOffset: TFileOfs): string;
+var
+  sec: Integer;
+  ofs: TFileOfs;
+  wb: PByte;
+  before, after1, after2, fresh, fresh2: Byte;
+  orig8, pat8, chk8: array[0..7] of Byte;
+  k: Integer;
+  rmwOk, byteOk, closeOk: Boolean;
+  {$IFDEF WINDOWS}
+  h2: THandle;
+  mem2: Pointer;
+  got: Int64;
+  nread, nwritten: DWORD;
+  {$ELSE}
+  n: Integer;
+  {$ENDIF}
+
+  function Hex8(const A: array of Byte): string;
+  var j: Integer;
+  begin
+    Result := '';
+    for j := 0 to 7 do Result := Result + IntToHex(A[j], 2) + ' ';
+  end;
+
+  procedure Say(const S: string);
+  begin
+    Result := Result + S + LineEnding;
+  end;
+
+begin
+  Result := '';
+  rmwOk := False; byteOk := False;
+  sec := FSector;
+  if sec <= 0 then sec := 512;
+  ofs := (ATestOffset div sec) * sec;          // test on a whole sector
+
+  Say('--- HEXO device write diagnostics ---');
+  Say('device        : ' + FDevice);
+  Say(Format('size          : %d bytes (0x%s)', [FSize, IntToHex(FSize, 8)]));
+  Say(Format('sector size   : %d', [sec]));
+  Say('opened for    : ' + BoolToStr(FWritable, 'read + WRITE', 'read only'));
+  {$IFDEF WINDOWS}
+  Say('open flags    : NO_BUFFERING | WRITE_THROUGH (when writable)');
+  Say(Format('volumes locked: %s', [BoolToStr(FExclusive, 'yes', 'NO')]));
+  if FLockLog <> '' then
+  begin
+    Say('volume report :');
+    Result := Result + FLockLog;
+  end
+  else
+    Say('volume report : (none - no volume of this device was found)');
+  Say(Format('all dismounted: %s', [BoolToStr(FAllDismounted, 'yes', 'NO')]));
+  {$ELSE}
+  Say('platform      : POSIX (plain file/stream access)');
+  {$ENDIF}
+  Say(Format('test sector   : 0x%s', [IntToHex(ofs, 8)]));
+  {$IFDEF WINDOWS}
+  if InMountedVolume(ofs) then
+    Say('              : INSIDE a mounted volume of this disk')
+  else
+    Say('              : outside every mounted volume of this disk');
+  {$ENDIF}
+
+  if not FWritable then
+  begin
+    Say('RESULT        : opened read-only, nothing to test.');
+    Exit;
+  end;
+  if (FSize > 0) and (ofs + sec > FSize) then
+  begin
+    Say('RESULT        : test offset is past the end of the device.');
+    Exit;
+  end;
+
+  try
+    wb := WorkBuf(sec);
+  except
+    on E: Exception do begin Say('buffer        : FAILED - ' + E.Message); Exit; end;
+  end;
+
+  {$IFDEF WINDOWS}
+  { 1. read the sector }
+  if not SetFilePointerEx(FHandle, ofs, @got, FILE_BEGIN) then
+  begin Say(Format('seek          : FAILED (error %d)', [GetLastError])); Exit; end;
+  nread := 0;
+  if not ReadFile(FHandle, wb^, sec, nread, nil) then
+  begin Say(Format('read          : FAILED (error %d)', [GetLastError])); Exit; end;
+  Say(Format('read          : ok (%d bytes)', [Integer(nread)]));
+  before := wb^;
+
+  { 2. flip one byte and write the sector back }
+  wb^ := before xor $FF;
+  if not SetFilePointerEx(FHandle, ofs, @got, FILE_BEGIN) then
+  begin Say(Format('seek #2       : FAILED (error %d)', [GetLastError])); Exit; end;
+  nwritten := 0;
+  if not WriteFile(FHandle, wb^, sec, nwritten, nil) then
+  begin
+    Say(Format('write         : FAILED (error %d)', [GetLastError]));
+    Say('RESULT        : Windows refused the write - see the error code above.');
+    Exit;
+  end;
+  Say(Format('write         : reported ok (%d bytes)', [Integer(nwritten)]));
+  FlushFileBuffers(FHandle);
+  Say('flush         : done');
+
+  { 3. read it back three ways - the difference between them is the answer }
+  if not SetFilePointerEx(FHandle, ofs, @got, FILE_BEGIN) then
+  begin Say(Format('seek #3       : FAILED (error %d)', [GetLastError])); Exit; end;
+  nread := 0;
+  if not ReadFile(FHandle, wb^, sec, nread, nil) then
+  begin Say(Format('read back     : FAILED (error %d)', [GetLastError])); Exit; end;
+  after1 := wb^;
+  Say(Format('read back #1  : 0x%s  (same handle, at once)', [IntToHex(after1, 2)]));
+
+  // a brand-new handle: Windows must go to the storage stack again
+  fresh := 0;
+  if VerifyReadAt(ofs, fresh, 1) = 1 then
+    Say(Format('read back #2  : 0x%s  (fresh handle)', [IntToHex(fresh, 2)]))
+  else
+    Say('read back #2  : FAILED (fresh handle)');
+
+  // and once more after a pause - a lying controller drops its cache by now
+  Sleep(2000);
+  fresh2 := 0;
+  if VerifyReadAt(ofs, fresh2, 1) = 1 then
+    Say(Format('read back #3  : 0x%s  (fresh handle, after 2 s)',
+      [IntToHex(fresh2, 2)]))
+  else
+    Say('read back #3  : FAILED (fresh handle, after 2 s)');
+  Say(Format('              : was 0x%s, wrote 0x%s',
+    [IntToHex(before, 2), IntToHex(before xor $FF, 2)]));
+
+  { 4. put the original byte back, whatever happened }
+  wb^ := before;
+  SetFilePointerEx(FHandle, ofs, @got, FILE_BEGIN);
+  nwritten := 0;
+  if WriteFile(FHandle, wb^, sec, nwritten, nil) then
+  begin
+    FlushFileBuffers(FHandle);
+    SetFilePointerEx(FHandle, ofs, @got, FILE_BEGIN);
+    nread := 0;
+    ReadFile(FHandle, wb^, sec, nread, nil);
+    after2 := wb^;
+    Say(Format('restore       : ok (byte is now 0x%s)', [IntToHex(after2, 2)]));
+  end
+  else
+    Say(Format('restore       : FAILED (error %d) - the test byte may be left ' +
+      'flipped!', [GetLastError]));
+  {$ELSE}
+  FStream.Position := ofs;
+  n := FStream.Read(wb^, sec);
+  if n <> sec then begin Say(Format('read : FAILED (%d of %d)', [n, sec])); Exit; end;
+  Say(Format('read          : ok (%d bytes)', [n]));
+  before := wb^;
+  wb^ := before xor $FF;
+  FStream.Position := ofs;
+  n := FStream.Write(wb^, sec);
+  if n <> sec then begin Say(Format('write : FAILED (%d of %d)', [n, sec])); Exit; end;
+  Say(Format('write         : reported ok (%d bytes)', [n]));
+  FStream.Position := ofs;
+  FStream.Read(wb^, sec);
+  after1 := wb^;
+  Say(Format('read back     : 0x%s (was 0x%s, wrote 0x%s)',
+    [IntToHex(after1, 2), IntToHex(before, 2), IntToHex(before xor $FF, 2)]));
+  wb^ := before;
+  FStream.Position := ofs;
+  FStream.Write(wb^, sec);
+  FStream.Position := ofs;
+  FStream.Read(wb^, sec);
+  after2 := wb^;
+  Say(Format('restore       : ok (byte is now 0x%s)', [IntToHex(after2, 2)]));
+  {$ENDIF}
+
+  { 5. the two paths the real commit uses - this is where an edit is lost }
+  Say('');
+  Say('--- path the commit uses: WriteAt (read-modify-write) ---');
+  if VerifyReadAt(ofs, orig8[0], 8) <> 8 then
+    Say('keep original : FAILED')
+  else
+  begin
+    Say('original 8 B  : ' + Hex8(orig8));
+
+    for k := 0 to 7 do pat8[k] := $A5;
+    try
+      WriteAt(ofs, pat8[0], 8);
+      Flush;
+      FillChar(chk8, 8, 0); VerifyReadAt(ofs, chk8[0], 8);
+      Say('one 8-byte call, fresh read : ' + Hex8(chk8));
+      Sleep(1500);
+      FillChar(chk8, 8, 0); VerifyReadAt(ofs, chk8[0], 8);
+      Say('               after 1.5 s  : ' + Hex8(chk8));
+      rmwOk := True;
+      for k := 0 to 7 do if chk8[k] <> $A5 then rmwOk := False;
+    except
+      on E: Exception do begin Say('WriteAt FAILED: ' + E.Message); rmwOk := False; end;
+    end;
+
+    // and byte by byte, which is exactly what typing into the grid produces
+    for k := 0 to 7 do pat8[k] := $5A;
+    try
+      for k := 0 to 7 do WriteAt(ofs + k, pat8[k], 1);
+      Flush;
+      FillChar(chk8, 8, 0); VerifyReadAt(ofs, chk8[0], 8);
+      Say('8 x 1-byte calls, fresh read: ' + Hex8(chk8));
+      Sleep(1500);
+      FillChar(chk8, 8, 0); VerifyReadAt(ofs, chk8[0], 8);
+      Say('               after 1.5 s  : ' + Hex8(chk8));
+      byteOk := True;
+      for k := 0 to 7 do if chk8[k] <> $5A then byteOk := False;
+    except
+      on E: Exception do begin Say('WriteAt FAILED: ' + E.Message); byteOk := False; end;
+    end;
+
+    // put the original bytes back
+    try
+      WriteAt(ofs, orig8[0], 8);
+      Flush;
+      FillChar(chk8, 8, 0); VerifyReadAt(ofs, chk8[0], 8);
+      Say('restored 8 B  : ' + Hex8(chk8));
+    except
+      on E: Exception do Say('restore FAILED: ' + E.Message);
+    end;
+  end;
+
+  {$IFDEF WINDOWS}
+  { 6. the scenario that actually loses the data: let go of every handle }
+  Say('');
+  Say('--- close every handle, then reopen and look again ---');
+  for k := 0 to 7 do pat8[k] := $C3;
+  closeOk := False;
+  try
+    WriteAt(ofs, pat8[0], 8);
+    Flush;
+    FillChar(chk8, 8, 0); VerifyReadAt(ofs, chk8[0], 8);
+    Say('written, our handle open   : ' + Hex8(chk8));
+
+    // release everything this object holds on the device
+    UnlockVolumes;
+    if FHandle <> INVALID_HANDLE_VALUE then CloseHandle(FHandle);
+    FHandle := INVALID_HANDLE_VALUE;
+    Sleep(1500);
+
+    // now a completely independent handle, with nothing of ours open
+    h2 := CreateFile(PChar(FDevice), GENERIC_READ,
+            FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL or FILE_FLAG_NO_BUFFERING, 0);
+    if h2 = INVALID_HANDLE_VALUE then
+      Say(Format('reopen        : FAILED (error %d)', [GetLastError]))
+    else
+    begin
+      mem2 := VirtualAlloc(nil, sec, MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE);
+      if mem2 = nil then
+        Say('reopen        : out of memory')
+      else
+      begin
+        if SetFilePointerEx(h2, ofs, @got, FILE_BEGIN) then
+        begin
+          nread := 0;
+          if ReadFile(h2, mem2^, sec, nread, nil) and (Integer(nread) >= 8) then
+          begin
+            Move(mem2^, chk8[0], 8);
+            Say('after close + reopen       : ' + Hex8(chk8));
+            closeOk := True;
+            for k := 0 to 7 do if chk8[k] <> $C3 then closeOk := False;
+          end
+          else
+            Say(Format('read after reopen: FAILED (error %d)', [GetLastError]));
+        end
+        else
+          Say(Format('seek after reopen: FAILED (error %d)', [GetLastError]));
+        VirtualFree(mem2, 0, MEM_RELEASE);
+      end;
+      CloseHandle(h2);
+    end;
+
+    // take the device back so the view keeps working, and undo the test bytes
+    FHandle := CreateFile(PChar(FDevice), GENERIC_READ or GENERIC_WRITE,
+      FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL or FILE_FLAG_NO_BUFFERING or FILE_FLAG_WRITE_THROUGH, 0);
+    if FHandle = INVALID_HANDLE_VALUE then
+      Say(Format('re-acquire    : FAILED (error %d) - close the tab and open ' +
+        'the device again', [GetLastError]))
+    else
+    begin
+      if FLockVols then try LockVolumes; except end;
+      try
+        WriteAt(ofs, orig8[0], 8);
+        Flush;
+        FillChar(chk8, 8, 0); VerifyReadAt(ofs, chk8[0], 8);
+        Say('restored again             : ' + Hex8(chk8));
+      except
+        on E: Exception do Say('restore FAILED: ' + E.Message);
+      end;
+    end;
+  except
+    on E: Exception do Say('close/reopen test FAILED: ' + E.Message);
+  end;
+  {$ENDIF}
+
+  Say('');
+  {$IFDEF WINDOWS}
+  if not closeOk then
+    Say('CLOSE CYCLE   : the bytes are LOST as soon as every handle is closed.')
+  else
+    Say('CLOSE CYCLE   : the bytes survive closing and reopening.');
+  if not rmwOk then
+    Say('RMW           : the read-modify-write path LOSES the data.')
+  else if not byteOk then
+    Say('RMW           : one 8-byte write sticks, but 8 single-byte writes to ' +
+        'the same sector do not.')
+  else
+    Say('RMW           : both write paths stick.');
+  if after1 <> Byte(before xor $FF) then
+    Say('RESULT        : the write was SWALLOWED outright - reported ok, the ' +
+        'old byte came straight back.' + LineEnding +
+        '                Write-protected media, or the sector is guarded.')
+  else if (fresh <> Byte(before xor $FF)) or (fresh2 <> Byte(before xor $FF)) then
+    Say('RESULT        : the DEVICE IS LYING. It acknowledges the write and ' +
+        'serves it from' + LineEnding +
+        '                its own cache, but the media never takes it - a ' +
+        'fresh read gets the' + LineEnding +
+        '                old byte back. Typical of a failing or counterfeit ' +
+        'flash drive.' + LineEnding +
+        '                No program can write to this device.')
+  else
+    Say('RESULT        : the device really does accept writes at this offset.');
+  {$ELSE}
+  if after1 = Byte(before xor $FF) then
+    Say('RESULT        : the device DOES accept writes at this offset.')
+  else
+    Say('RESULT        : the write was SWALLOWED.');
+  {$ENDIF}
+end;
+
+constructor TRawDeviceByteSource.Create(const ADevice: string; AWritable: Boolean;
+  ALockVolumes: Boolean);
 {$IFDEF WINDOWS}
 var
   len: Int64;
-  br: DWORD;
+  br, access, flags: DWORD;
 begin
   inherited Create;
   FSector := 512;
-  FHandle := CreateFile(PChar(ADevice), GENERIC_READ,
-    FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING,
-    FILE_ATTRIBUTE_NORMAL, 0);
+  FDevice := ADevice;
+  FWritable := AWritable;
+  FLockVols := ALockVolumes;
+  FAllDismounted := True;
+  FMem := nil; FMemLen := 0;
+  access := GENERIC_READ;
+  flags := FILE_ATTRIBUTE_NORMAL;
+  if AWritable then
+  begin
+    access := access or GENERIC_WRITE;
+    // Buffered writes to a raw device go to the cache manager and can be
+    // dropped without any error - the write "succeeds" and the disk never
+    // changes. Unbuffered + write-through is the only reliable way.
+    flags := flags or FILE_FLAG_NO_BUFFERING or FILE_FLAG_WRITE_THROUGH;
+  end;
+  FHandle := CreateFile(PChar(ADevice), access,
+    FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING, flags, 0);
   if FHandle = INVALID_HANDLE_VALUE then
-    raise Exception.CreateFmt('Cannot open %s (error %d)', [ADevice, GetLastError]);
+    raise EHexOpen.CreateFor(ADevice, GetLastError);
+  QuerySectorSize;
   len := 0;
   if DeviceIoControl(FHandle, IOCTL_DISK_GET_LENGTH_INFO, nil, 0,
        @len, SizeOf(len), br, nil) then
     FSize := len
   else
     FSize := 0;
+  // always learn which parts of the disk belong to mounted volumes; only
+  // lock/dismount them when the caller asked for it
+  try LockVolumes; except end;
 end;
 {$ELSE}
+var
+  mode: Word;
 begin
   inherited Create;
   FSector := 512;
+  FDevice := ADevice;
+  FWritable := AWritable;
+  FLockVols := ALockVolumes;
   // on POSIX a block device path is read like a file (needs privileges);
   // size may be 0 for some block devices - acceptable fallback
-  FStream := TFileStream.Create(ADevice, fmOpenRead or fmShareDenyNone);
+  if AWritable then mode := fmOpenReadWrite else mode := fmOpenRead;
+  FStream := TFileStream.Create(ADevice, mode or fmShareDenyNone);
   FSize := FStream.Size;
 end;
 {$ENDIF}
 
+function TRawDeviceByteSource.CanWrite: Boolean;
+begin
+  Result := FWritable;
+end;
+
+procedure TRawDeviceByteSource.Flush;
+begin
+  {$IFDEF WINDOWS}
+  if FWritable and (FHandle <> INVALID_HANDLE_VALUE) then FlushFileBuffers(FHandle);
+  {$ENDIF}
+end;
+
+function TRawDeviceByteSource.WriteAt(APos: TFileOfs; const ABuf; ALen: Integer): Integer;
+var
+  alignStart, alignEnd: TFileOfs;
+  alignLen, ofs: Integer;
+  wb: PByte;
+  {$IFDEF WINDOWS}
+  got: Int64;
+  nread, nwritten: DWORD;
+  {$ELSE}
+  nread, nwritten: Integer;
+  {$ENDIF}
+begin
+  Result := 0;
+  if not FWritable then Exit;
+  if (APos < 0) or (ALen <= 0) then Exit;
+  // a device never grows or shrinks - anything past the end is refused
+  if (FSize > 0) and (APos >= FSize) then Exit;
+  if (FSize > 0) and (APos + ALen > FSize) then ALen := FSize - APos;
+
+  // raw devices only accept whole sectors, so patch inside a sector-aligned
+  // window: read it, drop the new bytes in, write the window back
+  alignStart := (APos div FSector) * FSector;
+  alignEnd := ((APos + ALen + FSector - 1) div FSector) * FSector;
+  alignLen := Integer(alignEnd - alignStart);
+  wb := WorkBuf(alignLen);
+
+  {$IFDEF WINDOWS}
+  if not SetFilePointerEx(FHandle, alignStart, @got, FILE_BEGIN) then
+    raise Exception.CreateFmt('Seek to 0x%s failed (error %d)',
+      [IntToHex(alignStart, 8), GetLastError]);
+  nread := 0;
+  if not ReadFile(FHandle, wb^, alignLen, nread, nil) then
+    raise Exception.CreateFmt('Read-before-write at 0x%s failed (error %d)',
+      [IntToHex(alignStart, 8), GetLastError]);
+  if Integer(nread) < alignLen then
+    raise Exception.CreateFmt('Short read before write at 0x%s (%d of %d bytes)',
+      [IntToHex(alignStart, 8), Integer(nread), alignLen]);
+
+  ofs := Integer(APos - alignStart);
+  Move(ABuf, (wb + ofs)^, ALen);
+
+  if not SetFilePointerEx(FHandle, alignStart, @got, FILE_BEGIN) then
+    raise Exception.CreateFmt('Seek to 0x%s failed (error %d)',
+      [IntToHex(alignStart, 8), GetLastError]);
+  nwritten := 0;
+  if not WriteFile(FHandle, wb^, alignLen, nwritten, nil) then
+    raise Exception.CreateFmt('Write at 0x%s failed (error %d)',
+      [IntToHex(alignStart, 8), GetLastError]);
+  if Integer(nwritten) <> alignLen then
+    raise Exception.CreateFmt('Short write at 0x%s (%d of %d bytes)',
+      [IntToHex(alignStart, 8), Integer(nwritten), alignLen]);
+  {$ELSE}
+  FStream.Position := alignStart;
+  nread := FStream.Read(wb^, alignLen);
+  if nread < alignLen then
+    raise Exception.CreateFmt('Short read before write at 0x%s (%d of %d bytes)',
+      [IntToHex(alignStart, 8), nread, alignLen]);
+  ofs := Integer(APos - alignStart);
+  Move(ABuf, (wb + ofs)^, ALen);
+  FStream.Position := alignStart;
+  nwritten := FStream.Write(wb^, alignLen);
+  if nwritten <> alignLen then
+    raise Exception.CreateFmt('Short write at 0x%s (%d of %d bytes)',
+      [IntToHex(alignStart, 8), nwritten, alignLen]);
+  {$ENDIF}
+  Result := ALen;
+end;
+
 destructor TRawDeviceByteSource.Destroy;
 begin
   {$IFDEF WINDOWS}
+  UnlockVolumes;                 // hand the volumes back to Windows
   if FHandle <> INVALID_HANDLE_VALUE then CloseHandle(FHandle);
+  if FMem <> nil then VirtualFree(FMem, 0, MEM_RELEASE);
   {$ELSE}
   FStream.Free;
   {$ENDIF}
@@ -451,6 +1370,7 @@ function TRawDeviceByteSource.ReadAt(APos: TFileOfs; var ABuf; ALen: Integer): I
 var
   alignStart, alignEnd: TFileOfs;
   alignLen, ofs: Integer;
+  wb: PByte;
   {$IFDEF WINDOWS}
   dist, got: Int64;
   nread: DWORD;
@@ -467,20 +1387,20 @@ begin
   alignStart := (APos div FSector) * FSector;
   alignEnd := ((APos + ALen + FSector - 1) div FSector) * FSector;
   alignLen := Integer(alignEnd - alignStart);
-  if Length(FBuf) < alignLen then SetLength(FBuf, alignLen);
+  wb := WorkBuf(alignLen);
 
   {$IFDEF WINDOWS}
   dist := alignStart;
   if SetFilePointerEx(FHandle, dist, @got, FILE_BEGIN) then
   begin
     nread := 0;
-    if not ReadFile(FHandle, FBuf[0], alignLen, nread, nil) then Exit;
+    if not ReadFile(FHandle, wb^, alignLen, nread, nil) then Exit;
   end
   else
     Exit;
   {$ELSE}
   FStream.Position := alignStart;
-  nread := FStream.Read(FBuf[0], alignLen);
+  nread := FStream.Read(wb^, alignLen);
   {$ENDIF}
 
   ofs := Integer(APos - alignStart);
@@ -488,7 +1408,7 @@ begin
   Result := Integer(nread) - ofs;
   if Result > ALen then Result := ALen;
   if Result > 0 then
-    System.Move(FBuf[ofs], ABuf, Result);
+    System.Move((wb + ofs)^, ABuf, Result);
 end;
 
 { TEditByteSource - non-destructive piece-table editing layer ---------------- }
@@ -632,6 +1552,7 @@ end;
 procedure TEditByteSource.InsertData(APos: TFileOfs; const AData; ALen: Integer);
 var addStart: TFileOfs;
 begin
+  if FFixedLength then Exit;      // would grow the image - never on a device
   if ALen <= 0 then Exit;
   if APos < 0 then APos := 0;
   if APos > FSize then APos := FSize;
@@ -643,6 +1564,7 @@ end;
 
 procedure TEditByteSource.DeleteRange(APos, ALen: TFileOfs);
 begin
+  if FFixedLength then Exit;      // would shrink the image
   if (ALen <= 0) or (APos < 0) or (APos >= FSize) then Exit;
   PushUndo;
   DoDelete(APos, ALen);
@@ -655,6 +1577,14 @@ begin
   if ALen <= 0 then Exit;
   if APos < 0 then APos := 0;
   if APos > FSize then APos := FSize;
+  // on a fixed-length image an overwrite may not run past the end: clip it,
+  // so the piece table can never come out longer than the backing store
+  if FFixedLength then
+  begin
+    if APos >= FSize then Exit;
+    if APos + ALen > FSize then ALen := Integer(FSize - APos);
+    if ALen <= 0 then Exit;
+  end;
   PushUndo;
   addStart := AppendToAdd(AData, ALen);
   d := ALen;
@@ -795,6 +1725,129 @@ begin
   finally
     fs.Free;
   end;
+end;
+
+function TEditByteSource.ModifiedRanges: TModRanges;
+var
+  i, n: Integer;
+  outPos: TFileOfs;
+begin
+  Result := nil;
+  n := 0;
+  outPos := 0;
+  for i := 0 to High(FPieces) do
+  begin
+    if FPieces[i].Kind = pkAdd then
+    begin
+      // merge with the previous run when they touch
+      if (n > 0) and (Result[n - 1].Start + Result[n - 1].Len = outPos) then
+        Result[n - 1].Len := Result[n - 1].Len + FPieces[i].Len
+      else
+      begin
+        Inc(n); SetLength(Result, n);
+        Result[n - 1].Start := outPos;
+        Result[n - 1].Len := FPieces[i].Len;
+      end;
+    end;
+    outPos := outPos + FPieces[i].Len;
+  end;
+end;
+
+function TEditByteSource.ModifiedByteCount: TFileOfs;
+var i: Integer;
+begin
+  Result := 0;
+  for i := 0 to High(FPieces) do
+    if FPieces[i].Kind = pkAdd then Result := Result + FPieces[i].Len;
+end;
+
+function TEditByteSource.CanCommit: Boolean;
+begin
+  Result := Assigned(FBack) and FBack.CanWrite and (FSize = FBack.Size);
+end;
+
+procedure TEditByteSource.CommitToBacking;
+const
+  WCHUNK = 1024 * 1024;         // multiple of any sector size
+var
+  i, k: Integer;
+  outPos, srcPos, remaining: TFileOfs;
+  chunk, w: Integer;
+  vbuf: array of Byte;
+begin
+  if not Assigned(FBack) or not FBack.CanWrite then
+    raise Exception.Create('Backing store is read-only.');
+  // a length change would shift everything after it; refuse rather than
+  // scribble a whole device over
+  if FSize <> FBack.Size then
+    raise Exception.CreateFmt(
+      'Size changed (%d vs %d) - cannot write back in place.', [FSize, FBack.Size]);
+
+  outPos := 0;
+  for i := 0 to High(FPieces) do
+  begin
+    if FPieces[i].Kind = pkAdd then
+    begin
+      remaining := FPieces[i].Len;
+      srcPos := FPieces[i].Start;
+      while remaining > 0 do
+      begin
+        if remaining > WCHUNK then chunk := WCHUNK else chunk := Integer(remaining);
+        w := FBack.WriteAt(outPos, PByte(FAdd.Memory)[srcPos], chunk);
+        if w <> chunk then
+          raise Exception.CreateFmt('Wrote %d of %d bytes at 0x%s.',
+            [w, chunk, IntToHex(outPos, 8)]);
+        Inc(outPos, chunk); Inc(srcPos, chunk); remaining := remaining - chunk;
+      end;
+    end
+    else
+      outPos := outPos + FPieces[i].Len;
+  end;
+  FBack.Flush;
+
+  // ---- read the written bytes back and compare -----------------------------
+  // A raw-device write can report success and change nothing at all (Windows
+  // dropping a cached write, a locked sector, a write-protected stick). The
+  // only honest way to know is to look.
+  SetLength(vbuf, WCHUNK);
+  outPos := 0;
+  for i := 0 to High(FPieces) do
+  begin
+    if FPieces[i].Kind = pkAdd then
+    begin
+      remaining := FPieces[i].Len;
+      srcPos := FPieces[i].Start;
+      while remaining > 0 do
+      begin
+        if remaining > WCHUNK then chunk := WCHUNK else chunk := Integer(remaining);
+        // a fresh handle, so neither the OS nor the drive's own cache can
+        // hand us back what we just wrote instead of what is on the media
+        if FBack.VerifyReadAt(outPos, vbuf[0], chunk) <> chunk then
+          raise EHexVerify.CreateAt(outPos);
+        if not CompareMem(@vbuf[0], PByte(FAdd.Memory) + srcPos, chunk) then
+        begin
+          for k := 0 to chunk - 1 do
+            if vbuf[k] <> PByte(FAdd.Memory)[srcPos + k] then
+              raise EHexVerify.CreateAt(outPos + k);
+          raise EHexVerify.CreateAt(outPos);
+        end;
+        Inc(outPos, chunk); Inc(srcPos, chunk); remaining := remaining - chunk;
+      end;
+    end
+    else
+      outPos := outPos + FPieces[i].Len;
+  end;
+
+  // the edits ARE the backing store now: collapse to one clean original piece
+  SetLength(FPieces, 1);
+  FPieces[0].Kind := pkOrig;
+  FPieces[0].Start := 0;
+  FPieces[0].Len := FSize;
+  if FSize = 0 then SetLength(FPieces, 0);
+  FAdd.Clear;
+  SetLength(FUndo, 0);          // nothing to undo - it is on the disk
+  SetLength(FRedo, 0);
+  FModified := False;
 end;
 
 procedure TEditByteSource.Rebase(ANewBack: TByteSource; AOwnsBack: Boolean);
@@ -940,6 +1993,50 @@ begin
   Result := Assigned(FEdit);
 end;
 
+procedure THexView.OpenDevice(const ADevice: string; AWritable: Boolean;
+  ALockVolumes: Boolean);
+var dev: TRawDeviceByteSource;
+begin
+  dev := TRawDeviceByteSource.Create(ADevice, AWritable, ALockVolumes);
+  if AWritable then
+  begin
+    // writable: full edit layer on top, but the length is nailed down
+    SetByteSource(TEditByteSource.Create(dev, True), True);
+    FEdit.FixedLength := True;
+    FInsertMode := False;           // insert cannot exist on a fixed image
+  end
+  else
+    SetByteSource(dev, True);       // read-only: no edit layer at all
+end;
+
+function THexView.IsFixedLength: Boolean;
+begin
+  Result := Assigned(FEdit) and FEdit.FixedLength;
+end;
+
+function THexView.CanCommit: Boolean;
+begin
+  Result := Assigned(FEdit) and FEdit.CanCommit;
+end;
+
+function THexView.ModifiedRanges: TModRanges;
+begin
+  if Assigned(FEdit) then Result := FEdit.ModifiedRanges else Result := nil;
+end;
+
+function THexView.ModifiedByteCount: TFileOfs;
+begin
+  if Assigned(FEdit) then Result := FEdit.ModifiedByteCount else Result := 0;
+end;
+
+procedure THexView.CommitToBacking;
+begin
+  if not Assigned(FEdit) then Exit;
+  FEdit.CommitToBacking;
+  Invalidate;
+  DoEditChange;
+end;
+
 function THexView.IsModified: Boolean;
 begin
   Result := Assigned(FEdit) and FEdit.Modified;
@@ -981,6 +2078,8 @@ end;
 
 procedure THexView.SetInsertMode(AValue: Boolean);
 begin
+  // a fixed-length image (device) has no insert mode to switch to
+  if AValue and IsFixedLength then AValue := False;
   if FInsertMode = AValue then Exit;
   FInsertMode := AValue;
   FLowNibble := False;

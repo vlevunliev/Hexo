@@ -16,7 +16,7 @@ uses
 
 const
   HEXO_NAME    = 'HEXO';
-  HEXO_VERSION = '1.0';
+  HEXO_VERSION = '1.2';
   HEXO_TAG     = 'VL';
 
 // build stamp of this binary - filled by the compiler, not by hand
@@ -27,7 +27,7 @@ const
   BUILD_DATE = {$I %DATE%};
   BUILD_TIME = {$I %TIME%};
 
-// 'HEXO 1.0 (VL)' - also handy for a window caption or a log header
+// 'HEXO 1.2 (VL)' - also handy for a window caption or a log header
 function HexoVersionString: string;
 
 procedure ShowAbout(AOwner: TComponent);

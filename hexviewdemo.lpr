@@ -8,8 +8,9 @@ program hexviewdemo;
 
 uses
   Interfaces, Classes, SysUtils, Forms, Controls, Menus, Dialogs, ComCtrls,
-  LCLType, ulang, uHexView, uhexcalc, uhexrsa, uhexhash, uhexchk, uhexcryptdlg,
-  ufcform, uhexabout;
+  LCLType, {$IFDEF WINDOWS}Windows, ShellApi,{$ENDIF}
+  ulang, uHexView, uhexcalc, uhexrsa, uhexhash, uhexchk, uhexcryptdlg,
+  ufcform, uhexabout, uhexdev;
 
 type
   { one document = one tab }
@@ -18,6 +19,9 @@ type
     View: THexView;
     FilePath: string;    // '' if never saved / device
     IsDevice: Boolean;
+    DevPath: string;     // raw device path, when IsDevice
+    DevWritable: Boolean;// device was opened for writing
+    DevLocked: Boolean;  // volumes of this device were locked/dismounted
   end;
 
   TDemoForm = class(TForm)
@@ -38,6 +42,7 @@ type
     function ConfirmDiscard(ADoc: TDocTab): Boolean;
     function DoSaveInternal(ADoc: TDocTab): Boolean;
     function DoSaveAs(ADoc: TDocTab): Boolean;
+    function CommitDevice(ADoc: TDocTab): Boolean;
     // menu handlers
     procedure DoOpen(Sender: TObject);
     procedure DoOpenDevice(Sender: TObject);
@@ -69,6 +74,9 @@ type
     procedure DoCrypto(Sender: TObject);
     procedure DoFindCrypto(Sender: TObject);
     procedure DoAbout(Sender: TObject);
+    procedure DoDevDiag(Sender: TObject);
+    procedure DoDevEject(Sender: TObject);
+    function ActiveRawDevice: TRawDeviceByteSource;
     procedure CalcSend(AValue: Int64);
     procedure CalcClosed(Sender: TObject; var CloseAction: TCloseAction);
     procedure RsaClosed(Sender: TObject; var CloseAction: TCloseAction);
@@ -167,7 +175,7 @@ var
   miHelp: TMenuItem;
 begin
   inherited CreateNew(AOwner, Num);
-  Caption := L('app.title', 'HEXO Version 1.0 (VL)');
+  Caption := L('app.title', 'HEXO 1.2 (VL)');
   Width := 980; Height := 660; Position := poScreenCenter;
   ShowInTaskBar := stAlways;
 
@@ -212,6 +220,9 @@ begin
   AddItem(miExtras, L('menu.calc', '&Калкулатор (hex)...'), @DoCalculator, ShortCut(VK_F2, []));
   AddItem(miExtras, L('menu.rsa', '&RSA modpow (a^b mod n)...'), @DoRsa, ShortCut(VK_F4, []));
   AddItem(miExtras, L('menu.checksum', '&Checksum / hash...'), @DoChecksum, ShortCut(VK_F6, []));
+  miExtras.AddSeparator;
+  AddItem(miExtras, L('menu.devdiag', '&Диагностика на записа (устройство)...'), @DoDevDiag);
+  AddItem(miExtras, L('menu.deveject', 'Безопасно &изваждане на устройството'), @DoDevEject);
   miExtras.AddSeparator;
   AddItem(miExtras, L('menu.lang.save', 'Запиши &езиков шаблон (hexview.lng)'), @DoSaveLang);
   AddItem(miExtras, L('menu.lang.reload', 'Презареди &езиков файл'), @DoReloadLang);
@@ -293,21 +304,32 @@ procedure TDemoForm.TabTitle(ADoc: TDocTab);
 var t: string;
 begin
   if ADoc.FilePath <> '' then t := ExtractFileName(ADoc.FilePath)
-  else if ADoc.IsDevice then t := ADoc.Caption
+  else if ADoc.IsDevice then
+  begin
+    t := ADoc.DevPath;
+    // a tab that can write to a raw disk says so, always
+    if not ADoc.DevWritable then t := t + ' [RO]'
+    else if ADoc.DevLocked then t := t + ' [RW+L]'
+    else t := t + ' [RW]';
+  end
   else t := L('tab.untitled', 'untitled');
   if Assigned(ADoc.View) and ADoc.View.IsModified then t := '*' + t;
   ADoc.Caption := t;
 end;
 
 procedure TDemoForm.UpdateUI;
-var v: THexView; mode, modf: string;
+var v: THexView; mode, modf, dev: string;
 begin
   v := ActiveView;
   if v = nil then begin FBar.SimpleText := L('status.nofile', 'No file open'); Exit; end;
   if v.InsertMode then mode := L('status.ins', 'INS') else mode := L('status.ovr', 'OVR');
   if v.IsModified then modf := L('status.mod', '  [MOD]') else modf := '';
+  dev := '';
+  if Assigned(ActiveDoc) and ActiveDoc.IsDevice then
+    if ActiveDoc.DevWritable then dev := L('status.devrw', '   ДИСК: ЗАПИС РАЗРЕШЕН')
+    else dev := L('status.devro', '   ДИСК: само четене');
   FBar.SimpleText := Format(L('status.fmt', 'Pos: 0x%s   Size: 0x%s   Sel: %d   %s%s'),
-    [IntToHex(v.CursorPos, 8), IntToHex(v.DataSize, 8), v.SelCount, mode, modf]);
+    [IntToHex(v.CursorPos, 8), IntToHex(v.DataSize, 8), v.SelCount, mode, modf]) + dev;
   FMiInsert.Checked := v.InsertMode;
   FMiHexSpaces.Checked := v.HexCopySpaces;
   if Assigned(ActiveDoc) then TabTitle(ActiveDoc);
@@ -325,9 +347,117 @@ begin
     end;
 end;
 
+function TDemoForm.CommitDevice(ADoc: TDocTab): Boolean;
+var
+  v: THexView;
+  r: TModRanges;
+  i, shown: Integer;
+  det, msg, typed, magic, warn: string;
+  total: Int64;
+  src: TByteSource;
+begin
+  Result := False;
+  v := ADoc.View;
+  if (v = nil) or not v.CanCommit then
+  begin
+    ShowMessage(L('dev.ro', 'Устройството е отворено само за четене.'));
+    Exit;
+  end;
+
+  r := v.ModifiedRanges;
+  if Length(r) = 0 then
+  begin
+    ShowMessage(L('dev.nochanges', 'Няма промени за записване.'));
+    Exit;
+  end;
+  total := v.ModifiedByteCount;
+
+  // spell out exactly which sectors are about to change
+  det := '';
+  shown := Length(r);
+  if shown > 8 then shown := 8;
+  for i := 0 to shown - 1 do
+    det := det + Format('    0x%s .. 0x%s   (%d B)',
+      [IntToHex(r[i].Start, 8), IntToHex(r[i].Start + r[i].Len - 1, 8), r[i].Len])
+      + LineEnding;
+  if Length(r) > shown then
+    det := det + Format(L('dev.more', '    ... и още %d диапазона'),
+      [Length(r) - shown]) + LineEnding;
+
+  // is any of this inside a volume Windows still has mounted?
+  warn := '';
+  src := v.Source;
+  if src is TEditByteSource then src := TEditByteSource(src).Backing;
+  if src is TRawDeviceByteSource then
+    if not TRawDeviceByteSource(src).Exclusive then
+      for i := 0 to Length(r) - 1 do
+        if TRawDeviceByteSource(src).InMountedVolume(r[i].Start) then
+        begin
+          warn := LineEnding + LineEnding + L('dev.mounted',
+            'ВНИМАНИЕ: част от диапазоните са в дял, който Windows държи' +
+            LineEnding + 'монтиран, а дяловете не са заключени. Записът там' +
+            LineEnding + 'може да бъде отменен от файловата система. За такава' +
+            LineEnding + 'редакция отвори устройството наново с "Запис +' +
+            LineEnding + 'заключване на дяловете".');
+          Break;
+        end;
+
+  { ---- потвърждение 1 от 2 ---- }
+  msg := Format(L('dev.warn1',
+    'На път си да запишеш направо върху %s.' + LineEnding + LineEnding +
+    '%d диапазона, общо %d байта:'), [ADoc.DevPath, Length(r), total]) +
+    LineEnding + det + LineEnding +
+    L('dev.warn1b',
+      'Това е НЕОБРАТИМО. Няма undo след записа.') + warn;
+  if QuestionDlg(L('dev.title', 'Запис върху устройство (1 от 2)'), msg, mtWarning,
+       [mrNo,  L('dev.cancel', 'Отказ'), 'IsDefault',
+        mrYes, L('dev.go', 'Продължи')], 0) <> mrYes then Exit;
+
+  { ---- потвърждение 2 от 2 ---- }
+  magic := L('dev.word', 'ЗАПИШИ');
+  typed := '';
+  if not InputQuery(L('dev.title2', 'Запис върху устройство (2 от 2)'),
+       Format(L('dev.warn2',
+         'Последно потвърждение за %s.' + LineEnding +
+         'Напиши %s и натисни OK:'), [ADoc.DevPath, magic]), typed) then Exit;
+  if UpperCase(Trim(typed)) <> UpperCase(magic) then
+  begin
+    ShowMessage(L('dev.notconfirmed', 'Не е потвърдено - нищо не е записано.'));
+    Exit;
+  end;
+
+  try
+    v.CommitToBacking;
+    Result := True;
+    ShowMessage(Format(L('dev.done', 'Записани %d байта в %d диапазона.'),
+      [total, Length(r)]));
+  except
+    // wrote "fine" but the device gave the old bytes back - the one failure
+    // mode that must never look like success
+    on E: EHexVerify do
+      ShowMessage(Format(L('dev.verifyfail',
+        'Записът НЕ се потвърди на офсет 0x%s.' + LineEnding +
+        'Устройството върна старите байтове - дискът НЕ е променен.' +
+        LineEnding + LineEnding +
+        'Възможни причини:' + LineEnding +
+        '- флашката/дискът е защитен от запис (ключе или контролер);' + LineEnding +
+        '- Windows пази секторите на монтиран дял - затвори програмите, които' +
+        LineEnding +
+        '  ползват диска, или го размонтирай от Управление на дисковете;' +
+        LineEnding +
+        '- програмата не е стартирана като администратор.'),
+        [IntToHex(E.Offset, 8)]));
+    on E: Exception do
+      ShowMessage(L('dev.failed', 'Записът се провали:') + LineEnding + E.Message);
+  end;
+  TabTitle(ADoc);
+  UpdateUI;
+end;
+
 function TDemoForm.DoSaveInternal(ADoc: TDocTab): Boolean;
 begin
   if (ADoc = nil) or (ADoc.View = nil) then Exit(False);
+  if ADoc.IsDevice then Exit(CommitDevice(ADoc));
   if not ADoc.View.IsEditable then
   begin ShowMessage(L('msg.readonly', 'This view is read-only (device).')); Exit(False); end;
   if ADoc.FilePath = '' then
@@ -379,24 +509,107 @@ begin
   end;
 end;
 
-procedure TDemoForm.DoOpenDevice(Sender: TObject);
-var s: string; d: TDocTab;
+{$IFDEF WINDOWS}
+// start another copy of ourselves with the "runas" verb, which is what makes
+// Windows put up the elevation prompt
+function RelaunchElevated: Boolean;
 begin
-  s := '\\.\PhysicalDrive0';
-  if InputQuery(L('dlg.opendevice.title', 'Open device'), L('dlg.opendevice.prompt', 'Device path (read-only):'), s) then
-  try
+  Result := ShellExecuteW(0, PWideChar(WideString('runas')),
+    PWideChar(WideString(ParamStr(0))), nil, nil, SW_SHOWNORMAL) > 32;
+end;
+{$ENDIF}
+
+procedure TDemoForm.DoOpenDevice(Sender: TObject);
+var
+  s: string;
+  d: TDocTab;
+  mode: Integer;
+  wr, lockVols: Boolean;
+
+  function TryOpen(AWritable, ALock: Boolean): Boolean;
+  begin
+    Result := False;
     d := NewTab(s);
     d.IsDevice := True;
-    d.View.SetByteSource(TRawDeviceByteSource.Create(s), True);  // read-only
-    d.View.SetFocus;
-    UpdateUI;
-  except
-    on E: Exception do
-    begin
-      ShowMessage(E.Message);
-      if Assigned(ActiveDoc) then ActiveDoc.Free;
+    d.DevPath := s;
+    d.DevWritable := AWritable;
+    d.DevLocked := AWritable and ALock;
+    try
+      d.View.OpenDevice(s, AWritable, ALock);
+      TabTitle(d);
+      d.View.SetFocus;
+      UpdateUI;
+      Result := True;
+    except
+      // access denied on a raw device means one thing in practice
+      on E: EHexOpen do
+      begin
+        FreeAndNil(d);
+        {$IFDEF WINDOWS}
+        if E.Code = 5 then
+        begin
+          if QuestionDlg(L('dev.admin.title', 'Нужни са администраторски права'),
+               Format(L('dev.admin.msg',
+                 'Windows отказа достъп до %s (грешка 5).' + LineEnding +
+                 LineEnding +
+                 'Суровият достъп до физически диск иска програмата да е' +
+                 LineEnding + 'стартирана като администратор.' + LineEnding +
+                 LineEnding + 'Да я пусна наново с администраторски права?'),
+                 [s]),
+               mtWarning,
+               [mrYes, L('dev.admin.relaunch', 'Пусни като администратор'),
+                'IsDefault', mrNo, L('dev.cancel', 'Отказ')], 0) = mrYes then
+            if RelaunchElevated then Close
+            else
+              ShowMessage(L('dev.admin.failed',
+                'Стартирането с администраторски права беше отказано.'));
+          Exit;
+        end;
+        {$ENDIF}
+        ShowMessage(E.Message);
+      end;
+      on E: Exception do
+      begin
+        FreeAndNil(d);
+        ShowMessage(E.Message);
+      end;
     end;
   end;
+
+begin
+  // pick from the drives the machine actually has, instead of typing a path
+  if not SelectDevice(Self, s) then Exit;
+  if Trim(s) = '' then Exit;
+
+  // read-only is the default answer; writing to a raw disk is opt-in
+  mode := QuestionDlg(L('dlg.devmode.title', 'Режим на отваряне'),
+          Format(L('dlg.devmode.msg',
+            'Как да отворя %s?' + LineEnding + LineEnding +
+            'Записът върху сурово устройство променя диска НЕОБРАТИМО.' +
+            LineEnding + 'Избери "Само за четене", ако не си сигурен.'), [s]),
+          mtWarning,
+          [mrNo,  L('dlg.devmode.ro', 'Само за четене'), 'IsDefault',
+           mrYes, L('dlg.devmode.rw', 'Четене и ЗАПИС'),
+           mrAll, L('dlg.devmode.rwlock', 'Запис + заключване на дяловете')], 0);
+  if mode = mrCancel then Exit;
+  wr := mode in [mrYes, mrAll];
+  // Locking is OFF by default: locking a volume and letting it go makes
+  // Windows re-mount it, and the re-mount puts the old bytes back over areas
+  // outside the volume (the MBR gap, most of all). Lock only on request, for
+  // edits that really live inside a mounted volume.
+  lockVols := mode = mrAll;
+
+  if TryOpen(wr, lockVols) then Exit;
+
+  // couldn't open writable (usually: not running as administrator)
+  if wr then
+    if QuestionDlg(L('dlg.devmode.title', 'Режим на отваряне'),
+         L('dlg.devfallback',
+           'Устройството не може да се отвори за запис.' + LineEnding +
+           'Да го отворя само за четене?'),
+         mtWarning,
+         [mrYes, L('btn.yes', 'Да'), 'IsDefault', mrNo, L('btn.no', 'Не')], 0) = mrYes then
+      TryOpen(False, False);
 end;
 
 procedure TDemoForm.DoSave(Sender: TObject);
@@ -407,7 +620,16 @@ end;
 
 procedure TDemoForm.DoSaveAsMenu(Sender: TObject);
 begin
-  if ActiveView <> nil then DoSaveAs(ActiveDoc);
+  if ActiveView = nil then Exit;
+  // "save as" on a device would dump the whole disk into a file
+  if ActiveDoc.IsDevice then
+  begin
+    ShowMessage(L('msg.devicesaveas',
+      'Устройство не се записва като файл.' + LineEnding +
+      'Маркирай диапазон и ползвай Редакция -> Експорт.'));
+    Exit;
+  end;
+  DoSaveAs(ActiveDoc);
 end;
 
 procedure TDemoForm.DoCloseTab(Sender: TObject);
@@ -654,6 +876,61 @@ end;
 procedure TDemoForm.DoAbout(Sender: TObject);
 begin
   ShowAbout(Self);
+end;
+
+// the raw source sits under the edit layer when the device is writable
+function TDemoForm.ActiveRawDevice: TRawDeviceByteSource;
+var d: TDocTab; src: TByteSource;
+begin
+  Result := nil;
+  d := ActiveDoc;
+  if (d = nil) or (not d.IsDevice) or (d.View = nil) then Exit;
+  src := d.View.Source;
+  if src is TEditByteSource then src := TEditByteSource(src).Backing;
+  if src is TRawDeviceByteSource then Result := TRawDeviceByteSource(src);
+end;
+
+procedure TDemoForm.DoDevEject(Sender: TObject);
+var dev: TRawDeviceByteSource;
+begin
+  dev := ActiveRawDevice;
+  if dev = nil then
+  begin
+    ShowMessage(L('diag.nodev',
+      'Отвори устройство първо (Файл -> Отвори устройство).'));
+    Exit;
+  end;
+  ShowMessage(dev.EjectDevice);
+end;
+
+procedure TDemoForm.DoDevDiag(Sender: TObject);
+var
+  d: TDocTab;
+  dev: TRawDeviceByteSource;
+  rep: string;
+begin
+  d := ActiveDoc;
+  dev := ActiveRawDevice;
+  if (d = nil) or (dev = nil) then
+  begin
+    ShowMessage(L('diag.nodev',
+      'Отвори устройство първо (Файл -> Отвори устройство).'));
+    Exit;
+  end;
+
+  if dev.CanWrite then
+    if QuestionDlg(L('diag.title', 'Диагностика на записа'),
+         Format(L('diag.warn',
+           'Тестът ще обърне ЕДИН байт на 0x%s и веднага ще го върне обратно.' +
+           LineEnding + 'Прави се върху %s.' + LineEnding + LineEnding +
+           'Да продължа?'),
+           [IntToHex((d.View.CursorPos div 512) * 512, 8), d.DevPath]),
+         mtWarning,
+         [mrNo, L('dev.cancel', 'Отказ'), 'IsDefault',
+          mrYes, L('dev.go', 'Продължи')], 0) <> mrYes then Exit;
+
+  rep := dev.Diagnose(d.View.CursorPos);
+  ShowReport(Self, L('diag.title', 'Диагностика на записа'), rep);
 end;
 
 procedure TDemoForm.DoSaveLang(Sender: TObject);

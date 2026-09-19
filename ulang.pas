@@ -39,13 +39,48 @@ begin
   else Result := ADefault;
 end;
 
+// A .lng line cannot hold a real newline, so multi-line prompts travel as \n
+// (and \t, \\). Escapes are resolved once, when the file is loaded.
+function Unescape(const S: string): string;
+var i: Integer;
+begin
+  Result := '';
+  i := 1;
+  while i <= Length(S) do
+  begin
+    if (S[i] = '\') and (i < Length(S)) then
+      case S[i + 1] of
+        'n': begin Result := Result + LineEnding; Inc(i, 2); Continue; end;
+        't': begin Result := Result + #9;         Inc(i, 2); Continue; end;
+        '\': begin Result := Result + '\';        Inc(i, 2); Continue; end;
+      end;
+    Result := Result + S[i];
+    Inc(i);
+  end;
+end;
+
+function Escape(const S: string): string;
+begin
+  Result := StringReplace(S, '\', '\\', [rfReplaceAll]);
+  Result := StringReplace(Result, #13#10, '\n', [rfReplaceAll]);
+  Result := StringReplace(Result, #10, '\n', [rfReplaceAll]);
+  Result := StringReplace(Result, #13, '\n', [rfReplaceAll]);
+  Result := StringReplace(Result, #9, '\t', [rfReplaceAll]);
+end;
+
 procedure LangLoadFile(const AFileName: string);
+var i: Integer; k: string;
 begin
   Ensure;
   Trans.Clear;
   if FileExists(AFileName) then
     try
       Trans.LoadFromFile(AFileName);
+      for i := 0 to Trans.Count - 1 do
+      begin
+        k := Trans.Names[i];
+        if k <> '' then Trans[i] := k + '=' + Unescape(Trans.ValueFromIndex[i]);
+      end;
     except
       Trans.Clear;
     end;
@@ -59,8 +94,10 @@ begin
   try
     sl.Add('; THexView language file  (UTF-8).  key=value, ; = comment.');
     sl.Add('; Edit the right-hand side; leave keys unchanged.');
+    sl.Add('; \n = new line, \t = tab, \\ = backslash.');
     sl.Add('');
-    for i := 0 to Defs.Count - 1 do sl.Add(Defs[i]);
+    for i := 0 to Defs.Count - 1 do
+      sl.Add(Defs.Names[i] + '=' + Escape(Defs.ValueFromIndex[i]));
     sl.SaveToFile(AFileName);
   finally
     sl.Free;
